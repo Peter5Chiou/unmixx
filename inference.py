@@ -11,6 +11,8 @@ import torch
 import torchaudio
 import torchaudio.transforms as T
 import look2hear.models
+from asteroid.dsp.overlap_add import LambdaOverlapAdd
+from functions.overpaladd_chunk_spec_feat import LambdaOverlapAdd_Chunkwise_SpectralFeatures
 
 # (옵션) salience 시각화 유틸이 필요하면 주석 해제
 # from basic_pitch_torch.inference import predict
@@ -78,6 +80,11 @@ def load_state_dict_safely(model: torch.nn.Module, ckpt_path: str):
 
 def prepare_audio_tensor(audio_path: str, target_sr: int, device: torch.device):
     waveform, original_sr = torchaudio.load(audio_path)  # [C, T]
+    
+    # Convert to mono if stereo
+    if waveform.shape[0] > 1:
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+        
     if original_sr != target_sr:
         resampler = T.Resample(orig_freq=original_sr, new_freq=target_sr)
         waveform = resampler(waveform)
@@ -118,6 +125,32 @@ def ensure_2d_channels_first(x: torch.Tensor):
         x = x.unsqueeze(0)
     return x
 
+class ModelWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+    def forward(self, x, **kwargs):
+        # UNMIXX returns (reconstructed, mag1, phase1, mag2, phase2)
+        # reconstructed shape: [B * nch * S, T]
+        # Ensure istest=True is passed to the underlying UNMIXX model
+        kwargs['istest'] = True
+        
+        # LambdaOverlapAdd passes chunks as [B_new, T]
+        if x.dim() == 2:
+            x = x.unsqueeze(1) # [B_new, 1, T]
+            
+        out = self.model(x, **kwargs)
+        reconstructed = out[0]
+        
+        # reconstructed shape from UNMIXX: [B_new * nch * S, T]
+        # We need to return [B_new, S, T]
+        if reconstructed.dim() == 3:
+            return reconstructed # [B, S, T]
+            
+        B_new, C, T_chunk = x.shape
+        S = reconstructed.shape[0] // (B_new * C)
+        return reconstructed.view(B_new, C, S, T_chunk).squeeze(1) # [B_new, S, T_chunk]
+
 # =========================
 # Main
 # =========================
@@ -147,6 +180,9 @@ def main():
     model = build_model(config)
     load_state_dict_safely(model, args.ckpt_path)
     model.to(device).eval()
+    
+    # Wrap model for LambdaOverlapAdd
+    wrapped_model = ModelWrapper(model)
 
     # Target SR
     cfg_sr = config["datamodule"]["data_config"]["sample_rate"]
@@ -158,9 +194,42 @@ def main():
     audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device)
     print(f"[Audio] shape (B,C,T)={tuple(audio_input.shape)}, sr={sr}")
 
-    # Forward
+    # Forward with chunking
     with torch.no_grad():
-        outs = model(audio_input, istest=True)
+        # Use LambdaOverlapAdd for long audio processing to avoid VRAM explosion
+        # Increased seq_dur to 4 seconds to improve source consistency (reduce permutation problem)
+        # hop_size = 1 second (75% overlap)
+        seq_dur = 4
+        window_size = int(seq_dur * target_sr)
+        hop_size = window_size // 4
+        
+        # Determine num_sources from model config or a small forward pass
+        num_sources = model.num_output if hasattr(model, 'num_output') else 2
+        
+        # Inference parameters for cleaner separation
+        vad_method = "spec"   # Options: "spec" (uses vad_threshold), "webrtc" (more aggressive noise filtering)
+        vad_threshold = 0.05   # Increase to reduce noise leakage in silent parts (only used if vad_method="spec")
+        n_mfcc = 20           # Increase (e.g., to 40) to improve source identification and reduce swapping
+        
+        continuous_model = LambdaOverlapAdd_Chunkwise_SpectralFeatures(
+            nnet=wrapped_model,
+            n_src=num_sources,
+            window_size=window_size,
+            hop_size=hop_size,
+            window=None,
+            reorder_chunks=True,
+            enable_grad=False,
+            device=device,
+            sr=target_sr,
+            vad_method=vad_method,
+            spectral_features="mfcc",
+            vad_threshold=vad_threshold,
+            n_mfcc=n_mfcc,
+            debug_silence_dur=0.2,
+            chunk_factor=0,
+        ).to(device)
+        
+        outs = continuous_model(audio_input)
 
     ests_speech, ests_speech_original = normalize_outputs(outs)
     # [B, S, T] 또는 [S, T]

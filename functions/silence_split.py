@@ -37,12 +37,12 @@ def webrtc_vad(wav, orig_sr, vad_mode=3, frame_size=0.03):
 
 
 # Code for silence split using the method in "Weakly Informed Source Separation, K. Shulcze-Forster, WASPAA 2019."
-def magspec_vad(wav, n_fft=1024, hop_length=256):
+def magspec_vad(wav, n_fft=1024, hop_length=256, threshold=0.1):
     stft = librosa.stft(wav, n_fft=n_fft, hop_length=hop_length, center=False)
     mag, phase = librosa.magphase(stft)
     mag = mag / np.max(mag)
     mag_sum = mag.sum(0)
-    mag_sum[mag_sum >= 0.1] = 1
+    mag_sum[mag_sum >= threshold] = 1
     mag_sum[mag_sum != 1] = 0
 
     diff = np.diff(np.pad(mag_sum, (1, 1)))

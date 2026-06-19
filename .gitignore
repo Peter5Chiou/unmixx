@@ -118,3 +118,6 @@ duet_svs/
 # figures/         # 논문용 그림 산출물은 종종 추적함
 # reports/         # 보고서/논문 빌드 산출물 폴더
 # scripts/local/   # 개인용 스크립트
+/separated_audio
+/separated_audio
+*.wav
