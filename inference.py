@@ -208,7 +208,7 @@ def main():
         
         # Inference parameters for cleaner separation
         vad_method = "spec"   # Options: "spec" (uses vad_threshold), "webrtc" (more aggressive noise filtering)
-        vad_threshold = 0.05   # Increase to reduce noise leakage in silent parts (only used if vad_method="spec")
+        vad_threshold = 0.0001   # Increase to reduce noise leakage in silent parts (only used if vad_method="spec")
         n_mfcc = 20           # Increase (e.g., to 40) to improve source identification and reduce swapping
         
         continuous_model = LambdaOverlapAdd_Chunkwise_SpectralFeatures(
@@ -226,7 +226,7 @@ def main():
             vad_threshold=vad_threshold,
             n_mfcc=n_mfcc,
             debug_silence_dur=0.2,
-            chunk_factor=0,
+            chunk_factor=4,
         ).to(device)
         
         outs = continuous_model(audio_input)
