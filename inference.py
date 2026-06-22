@@ -6,11 +6,15 @@ import argparse
 import yaml
 from pathlib import Path
 from pprint import pprint
-
+import numpy as np 
+import soundfile as sf
+import scipy.ndimage as ndimage
 import torch
 import torchaudio
 import torchaudio.transforms as T
 import look2hear.models
+import torch.nn.functional as F
+
 from asteroid.dsp.overlap_add import LambdaOverlapAdd
 from functions.overpaladd_chunk_spec_feat import LambdaOverlapAdd_Chunkwise_SpectralFeatures
 
@@ -151,6 +155,57 @@ class ModelWrapper(torch.nn.Module):
         S = reconstructed.shape[0] // (B_new * C)
         return reconstructed.view(B_new, C, S, T_chunk).squeeze(1) # [B_new, S, T_chunk]
 
+def preprocess_clean_wave_gpu(audio_tensor, sr, threshold=0.02, min_dur_sec=0.1, gap_merge_sec=0.2):
+    """
+    修正長度對齊問題後的 GPU 清洗函式
+    """
+    device = audio_tensor.device
+    T = audio_tensor.shape[-1]  # 紀錄原始長度
+    min_samples = int(sr * min_dur_sec)
+    gap_samples = int(sr * gap_merge_sec)
+    
+    # --- 步驟 1：包絡偵測 ---
+    k1 = int(sr * 0.02) 
+    if k1 % 2 == 0: k1 += 1
+    abs_audio = torch.abs(audio_tensor)
+    envelope = F.max_pool1d(abs_audio, kernel_size=k1, stride=1, padding=k1 // 2)
+    # 強制對齊長度
+    envelope = envelope[..., :T]
+    
+    # --- 步驟 2：門檻判定 ---
+    mask = (envelope > threshold).float() 
+    
+    # --- 步驟 3：合併微小間隙 ---
+    if gap_samples > 0:
+        k2 = gap_samples
+        if k2 % 2 == 0: k2 += 1
+        mask = F.max_pool1d(mask, kernel_size=k2, stride=1, padding=k2 // 2)
+        # 強制對齊長度
+        mask = mask[..., :T]
+
+    mask = mask.view(-1)
+    
+    # --- 步驟 4：偵測段落 ---
+    m = torch.cat([torch.tensor([0.0], device=device), mask, torch.tensor([0.0], device=device)])
+    diff = m[1:] - m[:-1]
+    
+    starts = (diff > 0).nonzero(as_tuple=True)[0]
+    ends = (diff < 0).nonzero(as_tuple=True)[0]
+    lengths = ends - starts
+    
+    # --- 步驟 5：長度過濾 ---
+    final_mask = torch.zeros_like(mask)
+    valid_segments = (lengths >= min_samples).nonzero(as_tuple=True)[0]
+    
+    for idx in valid_segments:
+        final_mask[starts[idx]:ends[idx]] = 1.0
+        
+    print(f"  [VAD Check] 原始片段: {len(starts)} | 長度達標: {len(valid_segments)}")
+    
+    # --- 步驟 6：應用 Mask ---
+    # 使用 view_as 確保形狀完全一致
+    return audio_tensor * final_mask.view(1, 1, -1)
+    
 # =========================
 # Main
 # =========================
@@ -162,6 +217,7 @@ def main():
     parser.add_argument("--output_dir", default="separated_audio", help="Output directory.")
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device selection.")
     parser.add_argument("--target_sr", type=int, default=None, help="Override target sample rate. (optional)")
+    parser.add_argument("--spectral_features", default="mfcc", choices=["mfcc", "spectral_centroid", "deep_embedding"], help="Features for source reordering.")
     args = parser.parse_args()
 
     # Device
@@ -194,6 +250,28 @@ def main():
     audio_input, waveform_cpu, sr = prepare_audio_tensor(args.audio_path, target_sr, device)
     print(f"[Audio] shape (B,C,T)={tuple(audio_input.shape)}, sr={sr}")
 
+   # ======================================================
+    # 【GPU 加速清洗】
+    # ======================================================
+    print(f"[Pre-process] GPU 加速清洗雜訊中 (threshold=0.02, min_dur_sec=0.1)...")
+    
+    audio_input = preprocess_clean_wave_gpu(
+        audio_input, 
+        target_sr, 
+        threshold=0.02,     # 能量門檻，維持不變
+        min_dur_sec=0.5,    # 提高到 0.5 秒，這能砍掉絕大多數吸氣聲與雜訊
+        gap_merge_sec=0.1   # 把 0.2 秒內的聲音連起來，保護歌聲不被切碎  
+    )
+    # 如果你還是想檢查結果，才轉回 CPU 存檔 (這步會耗一點點時間，檢查完可以註解掉)
+    debug_path = "debug_cleaned_input.wav"
+    debug_wav = audio_input.detach().cpu().squeeze().numpy()
+    sf.write(debug_path, debug_wav, target_sr)
+    print(f"[Pre-process] 抹平測試檔存於: {debug_path}")
+    
+    #import sys; sys.exit() 
+
+   
+    
     # Forward with chunking
     with torch.no_grad():
         # Use LambdaOverlapAdd for long audio processing to avoid VRAM explosion
@@ -207,10 +285,13 @@ def main():
         num_sources = model.num_output if hasattr(model, 'num_output') else 2
         
         # Inference parameters for cleaner separation
-        vad_method = "spec"   # Options: "spec" (uses vad_threshold), "webrtc" (more aggressive noise filtering)
-        vad_threshold = 0.0001   # Increase to reduce noise leakage in silent parts (only used if vad_method="spec")
-        n_mfcc = 20           # Increase (e.g., to 40) to improve source identification and reduce swapping
+        vad_method = "spec"   
         
+        # Output paths
+        model_name = derive_model_name(config, args.ckpt_path)
+        base_dir = Path(args.output_dir) / model_name / Path(args.audio_path).stem
+        base_dir.mkdir(parents=True, exist_ok=True)
+
         continuous_model = LambdaOverlapAdd_Chunkwise_SpectralFeatures(
             nnet=wrapped_model,
             n_src=num_sources,
@@ -222,11 +303,8 @@ def main():
             device=device,
             sr=target_sr,
             vad_method=vad_method,
-            spectral_features="mfcc",
-            vad_threshold=vad_threshold,
-            n_mfcc=n_mfcc,
-            debug_silence_dur=0.2,
-            chunk_factor=4,
+            spectral_features=args.spectral_features,
+            output_dir=str(base_dir),
         ).to(device)
         
         outs = continuous_model(audio_input)
@@ -245,10 +323,7 @@ def main():
     num_speakers = ests_speech.shape[0]
     print(f"[Separation] detected {num_speakers} streams")
 
-    # Output paths
-    model_name = derive_model_name(config, args.ckpt_path)
-    base_dir = Path(args.output_dir) / model_name / Path(args.audio_path).stem
-    base_dir.mkdir(parents=True, exist_ok=True)
+    # Output paths (already created above)
 
     # Save estimates
     for i in range(num_speakers):
@@ -265,6 +340,8 @@ def main():
     torchaudio.save(str(mix_out), waveform_cpu, sr)
 
     print("[Done] All files saved under:", base_dir)
+    with open("outputdir.txt", "w") as f:
+        f.write(str(base_dir))
 
 if __name__ == "__main__":
     main()
