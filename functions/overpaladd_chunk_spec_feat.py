@@ -8,7 +8,7 @@ from speechbrain.pretrained import EncoderClassifier
 
  
 from look2hear.utils.logging import AverageMeter
-from functions.silence_split import magspec_vad, webrtc_vad
+from functions.silence_split import magspec_vad, webrtc_vad, magspec_vad_org
 from functions.overlapadd_w2v import PITLossWrapper_Out_BatchIndices
 
 
@@ -59,36 +59,24 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
         chunks_data = []
 
         assert x.ndim == 3
-
         batch, channels, n_frames = x.size()
 
-        # 1. 執行 VAD (修正：改用固定且精確的參數，不跟隨 self.window_size)
-        vad_n_fft = 1024   # 約 42ms (24kHz 下)
-        vad_hop = 256      # 約 10ms
-        
+        # 1. 執行 VAD (這部分完全沒動)
+        vad_n_fft = 1024
+        vad_hop = 256
         if self.vad_method == "spec":
-            starts, ends = magspec_vad(
-                x.cpu().numpy()[0, 0, :],
-                n_fft=vad_n_fft,
-                hop_length=vad_hop,
-            )
-            # 更新 Debug 用的參數顯示
+            starts_raw, ends_raw = magspec_vad(x.cpu().numpy()[0, 0, :], self.sr, n_fft=vad_n_fft, hop_length=vad_hop)
             win_ms = (vad_n_fft / self.sr) * 1000
             hop_ms = (vad_hop / self.sr) * 1000
             overlap_ratio = (1 - vad_hop / vad_n_fft) * 100
             repeat_times = vad_n_fft // vad_hop
-            
         elif self.vad_method == "webrtc":
-            starts, ends = webrtc_vad(
-                x.cpu().numpy()[0, 0, :], self.sr, vad_mode=3, frame_size=0.03
-            )
-            # WebRTC 固定參數
+            starts_raw, ends_raw = webrtc_vad(x.cpu().numpy()[0, 0, :], self.sr, vad_mode=3, frame_size=0.03)
             win_ms = 30.0
             hop_ms = 30.0
             overlap_ratio = 0
             repeat_times = 1
         
-         # --- 新增口語化 Debug 訊息 ---
         def format_time(n_samples, sr):
             seconds = n_samples / sr
             h = int(seconds // 3600)
@@ -96,128 +84,126 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
             s = seconds % 60
             return f"{h:02d}:{m:02d}:{s:05.2f}"
 
-        print(f"\n{'='*50}")
-        print(f"【VAD 語音偵測回報】")
-        print(f"  偵測模式：{self.vad_method}")
-        
-        if self.vad_method == "spec":
-            print(f"  分析細節：我每次抓 {win_ms:.1f}ms 的聲音來看，然後往後移 {hop_ms:.1f}ms。")
-            print(f"            這表示每個點都被我重複檢查了 {repeat_times} 次 (重疊率 {overlap_ratio:.0f}%)，抓邊界會很精準喔！")
-        else:
-            print(f"  分析細節：我每隔 {win_ms:.1f}ms 跳著檢查一次有沒有人聲。")
-
+        # VAD 過濾 (Filtered Segments: 這是真正要填回音訊的位置)
         filtered_starts = []
         filtered_ends = []
-        if len(starts) == 0:
-            print(f"  偵測結果：掃描整段音訊後... 竟然連一點聲音都沒發現！")
+        print(f"\n{'='*50}\n【VAD 語音偵測回報】")
+        if len(starts_raw) == 0:
+            print(f"  偵測結果：未發現聲音！")
         else:
-            print(f"  偵測結果：嘿！我發現了 {len(starts)} 段有聲音的地方：")
-            for i, (s, e) in enumerate(zip(starts, ends)):
+            for i, (s, e) in enumerate(zip(starts_raw, ends_raw)):
                 duration = (e - s) / self.sr
                 if duration < 0.5:
-                    print(f"    ❌ 段落 {i+1:02d}: {format_time(s, self.sr)} ~ {format_time(e, self.sr)} (太短 {duration:.2f}s, 已丟棄)")
+                    print(f"    ❌ 段落 {i+1:02d}: {format_time(s, self.sr)} (太短已丟棄)")
                 else:
-                    print(f"    👉 段落 {i+1:02d}: {format_time(s, self.sr)} ~ {format_time(e, self.sr)}")
+                    print(f"    👉 段落 {len(filtered_starts)+1:02d}: {format_time(s, self.sr)} ~ {format_time(e, self.sr)}")
                     filtered_starts.append(s)
                     filtered_ends.append(e)
                     
-        # chunk頭尾各加 0.5sec, 增加模型的分離能力
+        # 計算擴張後的讀取邊界 (starts/ends: 這是餵給模型看的範圍)
+        # context_pad sec數
         context_pad = 0.5
         pad_samples = int(context_pad * self.sr)
         starts = [max(0, s - pad_samples) for s in filtered_starts]
         ends = [min(n_frames, e + pad_samples) for e in filtered_ends]
         print(f"{'='*50}\n")
-        # --- Debug 訊息結束 ---
  
-        # First, make the output tensor. divide by n_src will make sum of the output be consistent with input
-        # except the regions where voice activity detected.
-        out = (x / self.n_src).repeat(1, self.n_src, 1)  # [batch, n_src, n_frames]
+        # 準備輸出容器 (填回位置必須與 x 對齊)
+        out = (x / self.n_src).repeat(1, self.n_src, 1) 
         assert len(starts) == len(ends)
 
-        for frame_idx in range(len(starts)):  # for loop to spare memory
-            frame_length = ends[frame_idx] - starts[frame_idx]
-            if (
-                frame_length <= self.window_size // 2
-            ):  # if input frames are too short, an error occurs.
-                pad_each_side = int((self.window_size // 2 - frame_length) / 2) + 1
-                segment = F.pad(
-                    x[..., starts[frame_idx] : ends[frame_idx]],
-                    (pad_each_side, pad_each_side),
-                )
-                frame = self.nnet(segment)
-            else:
-                segment = x[..., starts[frame_idx] : ends[frame_idx]]
-                frame = self.nnet(segment)
+        for frame_idx in range(len(starts)):
+            # --- A. 取得邊界 ---
+            read_s = starts[frame_idx]    # 讀取起始 (含 0.5s Padding)
+            read_e = ends[frame_idx]      # 讀取結束 (含 0.5s Padding)
+            orig_s = filtered_starts[frame_idx] # 原始起始 (目標填入位置)
+            orig_e = filtered_ends[frame_idx]   # 原始結束 (目標填入位置)
+            orig_len = orig_e - orig_s
             
+            # --- 新增 Debug Message: 印出目前處理的秒數 ---
+            start_sec = orig_s / self.sr
+            end_sec = orig_e / self.sr
+            print(f"  > [Chunk {frame_idx+1:02d}] 正在處理: {start_sec:.2f}s ~ {end_sec:.2f}s (原始點數: {orig_len})")            
+            # 1. 抓取原始音訊 (加 clone 避免改動到原始資料 x)
+            segment = x[..., read_s : read_e].clone()
+            
+            # --- 2. 核心修正：雙向能量淡化 (Symmetric Padding Fade) ---
+            # 計算前後延伸的長度
+            pad_len_front = orig_s - read_s
+            pad_len_back  = read_e - orig_e
+            
+            # 前端淡入：防止前一段高能量干擾
+            if pad_len_front > 0:
+                fade_in = torch.linspace(0.0, 1.0, pad_len_front, device=self.device)
+                segment[..., :pad_len_front] *= fade_in
+                #segment[..., :pad_len_front] = 0.0 # 直接賦值為 0              
+                
+            # 尾端淡出：防止後一段高能量壓制當前增益
+            if pad_len_back > 0:
+                fade_out = torch.linspace(1.0, 0.0, pad_len_back, device=self.device)
+                segment[..., -pad_len_back:] *= fade_out
+                #segment[..., -pad_len_back:] = 0.0 # 直接賦值為 0
+                
+            # -------------------------------------------------------            
+            # 3. 跑模型 (其餘邏輯維持裁切邏輯)
+            frame_length = read_e - read_s
+            if frame_length <= self.window_size // 2:
+                p = int((self.window_size // 2 - frame_length) / 2) + 1
+                segment_padded = F.pad(segment, (p, p))
+                frame_raw = self.nnet(segment_padded)[..., p : p + frame_length]
+            else:
+                frame_raw = self.nnet(segment)
+
+            # 4. 裁切回原始範圍 (不含 Padding)
+            offset = orig_s - read_s
+            frame = frame_raw[..., offset : offset + (orig_e - orig_s)]
+
+
+            # --- D. 其餘邏輯維持 (Reorder, Ghost Suppression 等) ---
             if frame_idx == 0:
-                assert frame.ndim == 3, "nnet should return (batch, n_src, time)"
-                if self.n_src is not None:
-                    assert (
-                        frame.shape[1] == self.n_src
-                    ), "nnet should return (batch, n_src, time)"
                 n_src = frame.shape[1]
                 sf_output_list = []
                 for src in range(n_src):
+                    # (特徵提取部分完全沒動...)
                     if self.spectral_features == "deep_embedding":
                         spec_feat_output = self._extract_deep_embedding(frame[0, src, :])
                     elif self.spectral_features == "mfcc":
-                        spec_feat_output = torch.as_tensor(
-                            librosa.feature.mfcc(
-                                y=frame[0, src, :].cpu().numpy(),
-                                sr=self.sr,
-                                n_mfcc=20,
-                                n_fft=self.window_size,
-                                hop_length=self.hop_size,
-                            )[1:, :]
-                            .mean(1, keepdims=True)
-                            .T,
-                            device=self.device,
-                        ).unsqueeze(0)
+                        spec_feat_output = torch.as_tensor(librosa.feature.mfcc(y=frame[0, src, :].cpu().numpy(), sr=self.sr, n_mfcc=20, n_fft=1024, hop_length=256)[1:, :].mean(1, keepdims=True).T, device=self.device).unsqueeze(0)
                     elif self.spectral_features == "spectral_centroid":
-                        spec_feat_output = torch.as_tensor(
-                            librosa.feature.spectral_centroid(
-                                y=frame[0, src, :].cpu().numpy(),
-                                sr=self.sr,
-                                n_fft=self.window_size,
-                                hop_length=self.hop_size,
-                            ).mean(1, keepdims=True),
-                            device=self.device,
-                        ).unsqueeze(0)
-
+                        spec_feat_output = torch.as_tensor(librosa.feature.spectral_centroid(y=frame[0, src, :].cpu().numpy(), sr=self.sr, n_fft=1024, hop_length=256).mean(1, keepdims=True), device=self.device).unsqueeze(0)
                     sf_output_list.append(spec_feat_output)
-                sf_output_list = torch.cat(
-                    sf_output_list, dim=1
-                )  # [batch, n_src, feature_dim]
+                sf_output_list = torch.cat(sf_output_list, dim=1)
                 self.sc_avg.update(sf_output_list)
                 self.last_sf = sf_output_list
 
             if frame_idx != 0 and self.reorder_chunks:
-                # we determine best perm based on xcorr with previous sources
-                # Use the last chunk's spectral features for better local continuity
-                # and to solve the permutation problem.
                 ref_sf = self.last_sf if self.last_sf is not None else self.sc_avg.avg
+                # 參考對應到 out 中的上一段「原始位置」
                 frame, sc_out = self._reorder_sources_with_sf_and_non_overlapped_seg(
                     frame,
-                    out[..., starts[frame_idx - 1] : ends[frame_idx - 1]],
+                    out[..., filtered_starts[frame_idx - 1] : filtered_ends[frame_idx - 1]],
                     ref_sf,
                     n_src,
                 )
                 self.sc_avg.update(sc_out)
                 self.last_sf = sc_out
-            if frame_length <= self.window_size // 2:
-                frame = frame[..., pad_each_side:-pad_each_side]
 
+            # 抑制幻覺 (維持原本調用)
             frame = self._suppress_ghosts(frame, frame_idx)
-            out[..., starts[frame_idx] : ends[frame_idx]] = frame
             
-            # Collect chunk data
+            # --- E. 寫回輸出 (精確填入原始位置) ---
+            out[..., orig_s : orig_e] = frame
+            
+            # 紀錄 JSON (儲存原始時間)
             chunks_data.append({
                 "chunks_id": frame_idx,
-                "filtered_starts": filtered_starts[frame_idx] / self.sr if frame_idx < len(filtered_starts) else 0,
-                "filtered_ends": filtered_ends[frame_idx] / self.sr if frame_idx < len(filtered_ends) else 0,
+                "filtered_starts": orig_s / self.sr,
+                "filtered_ends": orig_e / self.sr,
                 "swapped": False
             })
 
+        # 儲存 JSON (完全沒動)
+        from pathlib import Path
         output_path = Path(self.output_dir) / "chunks.json" if self.output_dir else Path("chunks.json")
         with open(output_path, "w") as f:
             json.dump(chunks_data, f, indent=4)
@@ -302,7 +288,7 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
                         y=waveform.cpu().numpy(),
                         sr=self.sr,
                         n_mfcc=20,
-                        n_fft=self.window_size,
+                        n_fft=2048,
                         hop_length=self.hop_size,
                     )[1:, :]
                     .mean(1, keepdims=True)

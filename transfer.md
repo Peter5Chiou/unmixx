@@ -1,49 +1,36 @@
-# Project Transfer Summary: UNMIXX Source Separation Optimization
+# 靜音切分邏輯優化記錄 (Silence Split Optimization)
 
-## 1. Initial Objectives
-- **Stereo to Mono**: Ensure all input audio is converted to mono to match model requirements.
-- **VRAM Optimization**: Enable the processing of full-length songs (instead of just short clips) within a 12G VRAM limit.
+## 1. 問題背景
+在 `functions/silence_split.py` 的 `magspec_vad` 函數中，原先使用固定的能量閾值 `0.1` 來區分聲音與靜音。這導致了以下問題：
+- **片段過長**：當閾值設為 `0.1` 時，部分片段長度會高達 20 秒以上。
+- **片段過短**：若將閾值調高以減少長片段，則會導致部分片段被切得過細（僅 1-2 秒）。
 
-## 2. Implemented Changes in `inference.py`
+## 2. 討論過程與方案演進
+最初討論了透過「迭代提高閾值」來嘗試切分長片段，但隨後決定採用更為確定且穩健的**「強制分段策略」**，以避免在調高閾值時對其他正常片段造成影響。
 
-### Audio Pre-processing
-- Modified `prepare_audio_tensor` to detect stereo files and convert them to mono by averaging channels.
+## 3. 最終確定的實作邏輯
+針對 `magspec_vad` 的優化方案如下：
 
-### Chunk-based Inference (VRAM Fix)
-- Integrated `asteroid.dsp.overlap_add.LambdaOverlapAdd` to process audio in chunks.
-- Implemented a `ModelWrapper` to handle the model's output format and ensure compatibility with the overlap-add mechanism.
+### A. 能量分析重構
+- **全局正規化**：將能量計算 (STFT $\rightarrow$ Magnitude $\rightarrow$ Sum $\rightarrow$ Normalize) 獨立出來，對整段音訊計算一次正規化能量分佈 (`mag_sum`)，確保所有切分基準一致。
+- **參數擴展**：在 `magspec_vad` 函數簽名中加入 `sr` (Sample Rate) 參數，以便將時間（秒）精確轉換為樣本索引。
 
-### Solving the Permutation Problem (Source Swapping)
-- **The Issue**: Encountered "source swapping" where the main vocal and harmony would flip identities between chunks.
-- **First Attempt**: Increased `seq_dur` from 2s to 4s to provide more context and stronger correlation.
-- **Final Solution**: Replaced the basic `LambdaOverlapAdd` with `LambdaOverlapAdd_Chunkwise_SpectralFeatures`.
-    - **Mechanism**: Uses Voice Activity Detection (VAD) and MFCC spectral features to align sources across chunks via cosine similarity.
-    - **Configuration**: `spectral_features="mfcc"`, `vad_method="spec"`, `sr=24000`.
+### B. 切分流程
+1. **初步切分**：使用基礎閾值 `0.1` 進行第一次切分，獲取初始片段。
+2. **長片段處理 (針對長度 $> 9\text{s}$ 的片段)**：
+   - **尋找最低點**：在該片段的 $[2.5\text{s}, \min(9\text{s}, \text{剩餘長度})]$ 區間內，尋找能量最低點 (Local Minimum)。
+   - **強制切分**：在該最低點處將片段切開。
+   - **循環執行**：對剩餘部分重複上述步驟，直到剩餘長度 $< 9\text{s}$。
+3. **末端合併**：
+   - 若最後剩餘的片段長度 $< 2.5\text{s}$，則將其併入前一個子片段中，防止產生過小的碎片。
 
-## 3. VRAM & Performance Observations
-- **`seq_dur = 2s`**: Very low VRAM usage (~1G), but higher risk of source swapping.
-- **`seq_dur = 4s`**: Higher VRAM usage (~14G), exceeding the 12G limit on some hardware, but more stable source assignment.
-- **Trade-off**: The optimal `seq_dur` needs to be balanced between VRAM capacity and the stability of the spectral alignment.
+## 4. 影響範圍
+- **修改文件**：
+    - `functions/silence_split.py`: 實作上述新邏輯。
+    - `functions/overpaladd_chunk_spec_feat.py`: 更新調用，傳入 `sr=self.sr`。
+    - `functions/overlapadd_chunk_w2v.py`: 更新調用，傳入 `sr=self.sr`。
 
-## 4. Inference Quality Optimization (Latest)
-
-### VAD & Spectral Feature Enhancements
-- **Configurable VAD Threshold**: Modified `functions/silence_split.py` and `functions/overpaladd_chunk_spec_feat.py` to allow a configurable `vad_threshold` (default increased to `0.2`). This reduces noise leakage in silent parts.
-- **Enhanced Spectral Fingerprint**: Increased `n_mfcc` from `20` to `40` in `functions/overpaladd_chunk_spec_feat.py` to improve source identification and reduce swapping.
-- **VAD Method Switching**: Updated `inference.py` to allow switching between `"spec"` and `"webrtc"` VAD methods.
-
-### VRAM Safety Cap (OOM Fix)
-- **Segment Length Capping**: Implemented a safety cap in `functions/overpaladd_chunk_spec_feat.py`. If a VAD segment is too long (exceeds `2 * window_size`), it is now split into smaller chunks of `window_size` to prevent VRAM OOM.
-
-## 5. Current State & Pending Issues
-
-### Current State
-- The system can process full songs with a VRAM safety cap.
-- Stereo inputs are handled automatically.
-- VAD and MFCC parameters are now configurable in `inference.py`.
-
-### Pending Issue: Permutation Problem in Long Segments
-- **The Problem**: After implementing the VRAM safety cap (splitting long segments into chunks), the "source swapping" problem returned.
-- **Root Cause**: The reordering logic was only applied to the final chunk of a VAD segment, while the preceding chunks were assigned to the output tensor without reordering.
-- **Required Fix**: Refactor `ola_forward` in `functions/overpaladd_chunk_spec_feat.py` to perform reordering on **every single chunk** processed, ensuring identity consistency across the entire song.
-- **Progress**: `_extract_spectral_features` helper method has been implemented, but the `ola_forward` refactor is incomplete due to tool failures.
+## 5. 驗證方法
+建議使用模擬信號測試：
+- 建立一段包含長聲音區塊（例如 20s）的音訊。
+- 確認所有切分出的片段長度均在 $2.5\text{s} \sim 9\text{s}$ 之間。

@@ -56,6 +56,7 @@ class LambdaOverlapAdd_Chunkwise_Wav2Vec(LambdaOverlapAdd):
         if self.vad_method == "spec":
             starts, ends = magspec_vad(
                 x.cpu().numpy()[0, 0, :],
+                self.sr,
                 n_fft=self.window_size,
                 hop_length=self.hop_size,
             )

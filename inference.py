@@ -279,7 +279,7 @@ def main():
         # hop_size = 1 second (75% overlap)
         seq_dur = 4
         window_size = int(seq_dur * target_sr)
-        hop_size = window_size // 4
+        hop_size = window_size // 8
         
         # Determine num_sources from model config or a small forward pass
         num_sources = model.num_output if hasattr(model, 'num_output') else 2

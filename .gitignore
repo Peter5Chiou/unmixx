@@ -121,3 +121,4 @@ duet_svs/
 /separated_audio
 /separated_audio
 *.wav
+outputdir.txt
