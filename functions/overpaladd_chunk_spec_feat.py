@@ -31,6 +31,7 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
         vad_method="spec",
         spectral_features="mfcc",
         output_dir=None,
+        chunks_path=None,
     ):
         super().__init__(
             nnet, n_src, window_size, hop_size, window, reorder_chunks, enable_grad
@@ -51,6 +52,7 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
         self.vad_method = vad_method
         self.spectral_features = spectral_features
         self.output_dir = output_dir
+        self.chunks_path = chunks_path
         self.last_sf = None
 
     def ola_forward(self, x):
@@ -61,44 +63,56 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
         assert x.ndim == 3
         batch, channels, n_frames = x.size()
 
-        # 1. 執行 VAD (這部分完全沒動)
-        vad_n_fft = 1024
-        vad_hop = 256
-        if self.vad_method == "spec":
-            starts_raw, ends_raw = magspec_vad(x.cpu().numpy()[0, 0, :], self.sr, n_fft=vad_n_fft, hop_length=vad_hop)
-            win_ms = (vad_n_fft / self.sr) * 1000
-            hop_ms = (vad_hop / self.sr) * 1000
-            overlap_ratio = (1 - vad_hop / vad_n_fft) * 100
-            repeat_times = vad_n_fft // vad_hop
-        elif self.vad_method == "webrtc":
-            starts_raw, ends_raw = webrtc_vad(x.cpu().numpy()[0, 0, :], self.sr, vad_mode=3, frame_size=0.03)
-            win_ms = 30.0
-            hop_ms = 30.0
-            overlap_ratio = 0
-            repeat_times = 1
-        
-        def format_time(n_samples, sr):
-            seconds = n_samples / sr
-            h = int(seconds // 3600)
-            m = int((seconds % 3600) // 60)
-            s = seconds % 60
-            return f"{h:02d}:{m:02d}:{s:05.2f}"
-
-        # VAD 過濾 (Filtered Segments: 這是真正要填回音訊的位置)
+        # 1. 決定切割點 (自動 VAD 或 載入 JSON)
         filtered_starts = []
         filtered_ends = []
-        print(f"\n{'='*50}\n【VAD 語音偵測回報】")
-        if len(starts_raw) == 0:
-            print(f"  偵測結果：未發現聲音！")
+                
+        if self.chunks_path and Path(self.chunks_path).exists():
+            print(f"\n[Chunks] 載入指定切割點檔案: {self.chunks_path}")
+            with open(self.chunks_path, "r") as f:
+                chunks_json = json.load(f)
+        
+            for c in chunks_json:
+                filtered_starts.append(int(c["filtered_starts"] * self.sr))
+                filtered_ends.append(int(c["filtered_ends"] * self.sr))
+            print(f"  載入完成: {len(filtered_starts)} 個片段")
         else:
-            for i, (s, e) in enumerate(zip(starts_raw, ends_raw)):
-                duration = (e - s) / self.sr
-                if duration < 0.5:
-                    print(f"    ❌ 段落 {i+1:02d}: {format_time(s, self.sr)} (太短已丟棄)")
-                else:
-                    print(f"    👉 段落 {len(filtered_starts)+1:02d}: {format_time(s, self.sr)} ~ {format_time(e, self.sr)}")
-                    filtered_starts.append(s)
-                    filtered_ends.append(e)
+            print("自動切chunks....")
+            # 自動 VAD 邏輯
+            vad_n_fft = 1024
+            vad_hop = 256
+            if self.vad_method == "spec":
+                starts_raw, ends_raw = magspec_vad(x.cpu().numpy()[0, 0, :], self.sr, n_fft=vad_n_fft, hop_length=vad_hop)
+                win_ms = (vad_n_fft / self.sr) * 1000
+                hop_ms = (vad_hop / self.sr) * 1000
+                overlap_ratio = (1 - vad_hop / vad_n_fft) * 100
+                repeat_times = vad_n_fft // vad_hop
+            elif self.vad_method == "webrtc":
+                starts_raw, ends_raw = webrtc_vad(x.cpu().numpy()[0, 0, :], self.sr, vad_mode=3, frame_size=0.03)
+                win_ms = 30.0
+                hop_ms = 30.0
+                overlap_ratio = 0
+                repeat_times = 1
+            
+            def format_time(n_samples, sr):
+                seconds = n_samples / sr
+                h = int(seconds // 3600)
+                m = int((seconds % 3600) // 60)
+                s = seconds % 60
+                return f"{h:02d}:{m:02d}:{s:05.2f}"
+            
+            print(f"\n{'='*50}\n【VAD 語音偵測回報】")
+            if len(starts_raw) == 0:
+                print(f"  偵測結果：未發現聲音！")
+            else:
+                for i, (s, e) in enumerate(zip(starts_raw, ends_raw)):
+                    duration = (e - s) / self.sr
+                    if duration < 0.5:
+                        print(f"    ❌ 段落 {i+1:02d}: {format_time(s, self.sr)} (太短已丟棄)")
+                    else:
+                        print(f"    👉 段落 {len(filtered_starts)+1:02d}: {format_time(s, self.sr)} ~ {format_time(e, self.sr)}")
+                        filtered_starts.append(s)
+                        filtered_ends.append(e)
                     
         # 計算擴張後的讀取邊界 (starts/ends: 這是餵給模型看的範圍)
         # context_pad sec數
@@ -203,7 +217,6 @@ class LambdaOverlapAdd_Chunkwise_SpectralFeatures(LambdaOverlapAdd):
             })
 
         # 儲存 JSON (完全沒動)
-        from pathlib import Path
         output_path = Path(self.output_dir) / "chunks.json" if self.output_dir else Path("chunks.json")
         with open(output_path, "w") as f:
             json.dump(chunks_data, f, indent=4)

@@ -90,8 +90,8 @@ def magspec_vad(wav, sr, n_fft=1024, hop_length=256):
     # (此時的數量應該會接近你原本看到的 21 段)
 
     # --- 3. 處理 Sub-chunk 切分 (> 9秒) ---
-    min_len = int(4 * sr / hop_length) 
-    max_len = int(9.0 * sr / hop_length)
+    min_len = int(3 * sr / hop_length) 
+    max_len = int(6.0 * sr / hop_length)
     
     final_segments = []
     

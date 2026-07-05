@@ -3,4 +3,5 @@
   --ckpt_path ckpt/best.ckpt ^
   --audio_path %1 ^
   --output_dir separated_audio ^
-  --spectral_features mfcc
+  --spectral_features mfcc 
+REM  --chunks_path chunks.json

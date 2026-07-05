@@ -14,7 +14,6 @@ import torchaudio
 import torchaudio.transforms as T
 import look2hear.models
 import torch.nn.functional as F
-
 from asteroid.dsp.overlap_add import LambdaOverlapAdd
 from functions.overpaladd_chunk_spec_feat import LambdaOverlapAdd_Chunkwise_SpectralFeatures
 
@@ -218,7 +217,13 @@ def main():
     parser.add_argument("--device", default="auto", choices=["auto", "cpu", "cuda"], help="Device selection.")
     parser.add_argument("--target_sr", type=int, default=None, help="Override target sample rate. (optional)")
     parser.add_argument("--spectral_features", default="mfcc", choices=["mfcc", "spectral_centroid", "deep_embedding"], help="Features for source reordering.")
+    parser.add_argument("--chunks_path", default=None, help="Path to chunks.json for manual audio segmentation.")
     args = parser.parse_args()
+
+    if args.chunks_path:
+        if not Path(args.chunks_path).exists():
+            print(f"\n 指定切割點檔案不存在: {args.chunks_path}")
+            return
 
     # Device
     if args.device == "auto":
@@ -305,6 +310,7 @@ def main():
             vad_method=vad_method,
             spectral_features=args.spectral_features,
             output_dir=str(base_dir),
+            chunks_path=args.chunks_path,
         ).to(device)
         
         outs = continuous_model(audio_input)
