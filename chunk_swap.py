@@ -1,5 +1,6 @@
 import os
 import json
+import copy
 import numpy as np
 import soundfile as sf
 import sounddevice as sd
@@ -44,6 +45,7 @@ class WaveformSequencePlayer(ctk.CTk):
         self.is_playing = False
         self.current_playing_chunk_idx = None
         self.current_playing_visual_lane = 0 # 0: SPK1, 1: SPK2, 2: MIX
+        self.undo_history = []
         
         self.play_real_start_time = 0
         self.play_start_sec = 0
@@ -57,6 +59,15 @@ class WaveformSequencePlayer(ctk.CTk):
 
         self.setup_ui()
         self.check_default_output_dir()
+
+    def push_undo_snapshot(self):
+        self.undo_history.append(copy.deepcopy(self.chunks))
+
+    def pop_undo_snapshot(self):
+        if not self.undo_history:
+            return False
+        self.chunks = self.undo_history.pop()
+        return True
 
     def format_time(self, seconds):
         m, s = int(seconds // 60), int(seconds % 60)
@@ -202,6 +213,8 @@ class WaveformSequencePlayer(ctk.CTk):
     def confirm_split(self):
         if self.split_chunk_idx is None or self.split_time is None: return
         
+        self.push_undo_snapshot()
+        
         idx = self.split_chunk_idx
         chunk = self.chunks[idx]
         t_s = chunk['filtered_starts']
@@ -240,6 +253,16 @@ class WaveformSequencePlayer(ctk.CTk):
         
         messagebox.showinfo("成功", "已成功分割 Chunk，並自動翻轉後半段音軌！")
 
+    def handle_undo(self, event=None):
+        if self.edit_mode: return "break"
+        if self.is_playing: self.stop_playback()
+        if self.pop_undo_snapshot():
+            self.label_chunk_info.configure(text="已恢復上一動 (Undo)")
+            self.draw_all()
+        else:
+            self.label_chunk_info.configure(text="無可恢復的操作")
+        return "break"
+
     def setup_ui(self):
         self.header = ctk.CTkLabel(self, text="wave player", font=("Arial", 32, "bold"), text_color="red")
         self.header.pack(pady=5)
@@ -251,6 +274,7 @@ class WaveformSequencePlayer(ctk.CTk):
         self.mode_button = ctk.CTkSegmentedButton(self.top_bar, values=["一般模式", "分割模式"], command=self.select_mode)
         self.mode_button.pack(side="left", padx=10)
         self.mode_button.set("一般模式")
+        ctk.CTkButton(self.top_bar, text="Undo (Ctrl+Z)", width=100, fg_color=self.BTN_BLUE, hover=False, command=self.handle_undo).pack(side="left", padx=10)
         self.label_info = ctk.CTkLabel(self.top_bar, text="滾輪: 縮放 | 中鍵/Shift+左鍵: 平移", text_color="gray")
         self.label_info.pack(side="left", padx=10)
 
@@ -285,6 +309,7 @@ class WaveformSequencePlayer(ctk.CTk):
         self.bind("<Right>", self.handle_arrow_right)
         self.bind("<space>", self.handle_space)
         self.bind("<Return>", self.handle_enter)
+        self.bind("<Control-z>", self.handle_undo)
 
     def check_default_output_dir(self):
         if os.path.exists("outputdir.txt"):
